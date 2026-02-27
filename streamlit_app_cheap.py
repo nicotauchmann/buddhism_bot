@@ -6,10 +6,12 @@ from llama_index.llms.groq import Groq
 from llama_index.core import StorageContext, load_index_from_storage
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.core.memory import ChatMemoryBuffer
-from llama_index.core.llms import ChatMessage
+from llama_index.core.base.llms.types import ChatMessage, MessageRole
 
 # ---------- Streamlit config ----------
 st.set_page_config(page_title="Buddhism Info Bot", page_icon="🧘", layout="centered")
+
+TOP_K = 3
 
 
 # ---------- Helpers ----------
@@ -19,43 +21,27 @@ def get_secret(name: str, default: str | None = None) -> str | None:
     return os.getenv(name, default)
 
 
+def to_llama_history(messages: list[dict]) -> list[ChatMessage]:
+    out: list[ChatMessage] = []
+    for m in messages:
+        role = MessageRole.USER if m["role"] == "user" else MessageRole.ASSISTANT
+        out.append(ChatMessage(role=role, content=m["content"]))
+    return out
+
+
 BASE_DIR = Path(__file__).resolve().parent
-VECTOR_DIR = BASE_DIR / "vector_index"
-EMBED_CACHE_DIR = BASE_DIR / ".cache" / "embeddings"
-
-TOP_K = 3  # <-- fixed value, no slider
-
-# ---------- Sidebar ----------
-st.sidebar.header("Controls")
-if st.sidebar.button("Reset conversation", use_container_width=True):
-    st.session_state.messages = []
-    st.rerun()
-
-# ---------- UI ----------
-st.title("Buddhism Info Bot")
-st.write(
-    """
-Ask a question about Buddhism.  
-The bot answers **only from the indexed documents** and speaks like a **young Tibetan professor**.
-"""
-)
-
-# ---------- Per-user session memory ----------
-if "messages" not in st.session_state:
-    st.session_state.messages = []  # list of {"role": "user"/"assistant", "content": str}
-
-# Render chat history
-for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
+VECTOR_DIR = BASE_DIR / "vector_index"  # commit this folder to GitHub
+EMBED_CACHE_DIR = (
+    BASE_DIR / ".cache" / "embeddings"
+)  # ephemeral cache on Streamlit Cloud
 
 
-# ---------- Cached shared resources ----------
+# ---------- Resources (cached across reruns) ----------
 @st.cache_resource
 def make_llm() -> Groq:
-    api_key = st.secrets.get("GROQ_API_KEY")
+    api_key = get_secret("GROQ_API_KEY")
     if not api_key:
-        raise RuntimeError("Missing GROQ_API_KEY. Add it in Streamlit Secrets (TOML).")
+        raise RuntimeError("Missing GROQ_API_KEY (set it in Streamlit Cloud Secrets).")
     return Groq(model="llama-3.3-70b-versatile", api_key=api_key)
 
 
@@ -82,78 +68,92 @@ def load_vector_index():
     return load_index_from_storage(storage_context, embed_model=embeddings)
 
 
-def build_chat_engine():
-    """
-    Build a fresh chat engine for this request.
-    We reset memory each time and pass only this user's history (template behavior).
-    """
-    llm = make_llm()
-    index = load_vector_index()
+def get_chat_engine():
+    # Per-user (per-session) engine + memory
+    if "chat_engine" not in st.session_state:
+        llm = make_llm()
+        index = load_vector_index()
 
-    retriever = index.as_retriever(similarity_top_k=TOP_K)
-    memory = ChatMemoryBuffer.from_defaults(token_limit=2500)
+        memory = ChatMemoryBuffer.from_defaults(token_limit=3000)
 
-    context_prompt = (
-        "You are a young Tibetan professor. Speak calmly, clearly, and thoughtfully.\n"
-        "You must answer using ONLY the provided context.\n"
-        "If the context does not contain the answer, say you cannot find it in the provided texts.\n"
-        "Here is the relevant context:\n"
-        "{context_str}\n"
-    )
+        # This is the “system/context” instruction the condense_plus_context engine uses
+        context_prompt = (
+            "You are a helpful assistant who answers questions about Buddhism.\n"
+            "You must speak like young professor (calm, humble, thoughtful).\n\n"
+            "Here are the relevant documents for the context:\n"
+            "{context_str}\n\n"
+            "Instruction: Use the previous chat history or the context above to answer.\n"
+            "If the context does not contain the answer, say you cannot find it in the documents."
+        )
 
-    return index.as_chat_engine(
-        chat_mode="condense_plus_context",
-        llm=llm,
-        memory=memory,
-        retriever=retriever,
-        context_prompt=context_prompt,
-        verbose=False,
-    )
-
-
-def stream_and_collect(response):
-    collected = {"text": ""}
-
-    def gen():
-        for token in response.response_gen:
-            collected["text"] += token
-            yield token
-
-    return gen(), collected
+        # IMPORTANT: do NOT pass retriever=... here, or you can hit the “multiple values” error.
+        st.session_state.chat_engine = index.as_chat_engine(
+            chat_mode="condense_plus_context",
+            llm=llm,
+            memory=memory,
+            similarity_top_k=TOP_K,
+            context_prompt=context_prompt,
+            verbose=False,
+        )
+    return st.session_state.chat_engine
 
 
-# ---------- Chat input (auto-clears) ----------
-prompt = st.chat_input("Ask your question…")
+# ---------- UI ----------
+st.title("Buddhism Info Bot")
+st.write(
+    "Ask a question about Buddhism. The bot answers only from buddhistic literature."
+)
 
-if prompt:
-    # Store and show user message
-    st.session_state.messages.append({"role": "user", "content": prompt})
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+col1, col2 = st.columns([1, 3])
+with col1:
+    if st.button("Reset conversation", use_container_width=True):
+        st.session_state.messages = []
+        if "chat_engine" in st.session_state:
+            st.session_state.chat_engine.reset()
+        st.rerun()
+
+# Render chat history
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+# Input (auto-clears after submit)
+user_msg = st.chat_input("What is your question?")
+
+if user_msg:
+    # Show user message immediately
+    st.session_state.messages.append({"role": "user", "content": user_msg})
     with st.chat_message("user"):
-        st.markdown(prompt)
-
-    # Convert this user's session history to LlamaIndex ChatMessage list
-    bot_history = [
-        ChatMessage(role=m["role"], content=m["content"])
-        for m in st.session_state.messages
-        if m["role"] in ("user", "assistant")
-    ]
+        st.markdown(user_msg)
 
     try:
-        chat_engine = build_chat_engine()
+        chat_engine = get_chat_engine()
+
+        # “Reset memory each question and pass only this user’s history”
         chat_engine.reset()
+        llama_history = to_llama_history(
+            st.session_state.messages[:-1]
+        )  # history BEFORE this user message
 
+        streaming = chat_engine.stream_chat(user_msg, chat_history=llama_history)
+
+        chunks: list[str] = []
         with st.chat_message("assistant"):
-            with st.spinner("Consulting the scriptures…"):
-                response = chat_engine.stream_chat(prompt, chat_history=bot_history)
 
-            token_gen, collected = stream_and_collect(response)
-            st.write_stream(token_gen)
+            def gen():
+                for tok in streaming.response_gen:
+                    chunks.append(tok)
+                    yield tok
 
-        # Persist assistant response
+            st.write_stream(gen())
+
+        assistant_text = "".join(chunks).strip()
         st.session_state.messages.append(
-            {"role": "assistant", "content": collected["text"]}
+            {"role": "assistant", "content": assistant_text}
         )
 
     except Exception as e:
-        with st.chat_message("assistant"):
-            st.error(str(e))
+        st.error(str(e))
