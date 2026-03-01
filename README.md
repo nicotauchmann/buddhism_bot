@@ -1,4 +1,4 @@
-# buddhism_bot
+# Chatbot trained on buddhistic literature
 
 Basic chatbot using all-MiniLM-L6-v2 as embedding model and the Meta Llama 3.3 multilingual large language model.
 The literature is available at https://www.buddhistelibrary.org/
