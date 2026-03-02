@@ -11,7 +11,7 @@ from llama_index.core.base.llms.types import ChatMessage, MessageRole
 # ---------- Streamlit config ----------
 st.set_page_config(page_title="Buddhism Info Bot", page_icon="🧘", layout="centered")
 
-TOP_K = 4
+TOP_K = 3
 
 
 # ---------- Helpers ----------
